@@ -723,9 +723,9 @@ impl State {
     }
 
     pub(crate) fn try_tick(&self) -> bool {
-        match self.queue.pop() {
-            Err(_) => false,
-            Ok(runnable) => {
+        match self.pop_runnable() {
+            None => false,
+            Some(runnable) => {
                 // Notify another ticker now to pick up where this ticker left off, just in case
                 // running the task takes a long time.
                 self.notify();
@@ -735,6 +735,32 @@ impl State {
                 true
             }
         }
+    }
+
+    /// Pops a runnable task from the global queue, falling back to runner local queues.
+    ///
+    /// Runners buffer tasks in their local queues. If a runner is busy running a
+    /// long task, tasks in its local queue would otherwise be unreachable to
+    /// consumers that only look at the global queue.
+    #[inline]
+    fn pop_runnable(&self) -> Option<Runnable> {
+        if let Ok(runnable) = self.queue.pop() {
+            return Some(runnable);
+        }
+
+        // This is the slow path, so excluding runners for the duration of the
+        // scan does not affect normal task throughput.
+        let local_queues = self
+            .local_queues
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        for local in local_queues.iter() {
+            if let Ok(runnable) = local.pop() {
+                return Some(runnable);
+            }
+        }
+
+        None
     }
 
     pub(crate) async fn tick(&self) {
@@ -906,7 +932,7 @@ impl<'a> Ticker<'a> {
 
     /// Waits for the next runnable task to run.
     async fn runnable(&mut self) -> Runnable {
-        self.runnable_with(|| self.state.queue.pop().ok()).await
+        self.runnable_with(|| self.state.pop_runnable()).await
     }
 
     /// Waits for the next runnable task to run, given a function that searches for a task.
