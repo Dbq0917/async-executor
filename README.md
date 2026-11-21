@@ -36,6 +36,36 @@ let task = ex.spawn(async {
 future::block_on(ex.run(task));
 ```
 
+## Automatic blocking-task isolation
+
+Driving an [`Executor`] with a [`WorkerPool`] keeps one async worker per
+logical CPU by default. If a task performs a synchronous blocking call (a
+plain `std::thread::sleep`, a blocking syscall, etc.), the pool notices that
+the poll is taking too long, classifies that task as blocking without any
+cooperation from the caller, and moves it onto a dedicated blocking thread.
+A replacement async worker is spawned immediately, so a single blocking task
+can no longer drag the executor's concurrency down to one. Ordinary async
+tasks keep their original scheduling path and pay only a single relaxed
+atomic load per reschedule.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_executor::{Executor, WorkerPool};
+
+let executor = Arc::new(Executor::new());
+let _pool = WorkerPool::new(executor.clone());
+
+// This blocking task is detected and isolated automatically.
+let task = executor.spawn(async {
+    std::thread::sleep(Duration::from_millis(50));
+    42
+});
+
+assert_eq!(futures_lite::future::block_on(task), 42);
+```
+
 ## License
 
 Licensed under either of

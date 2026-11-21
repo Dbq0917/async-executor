@@ -50,8 +50,14 @@ use core::marker::PhantomData;
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+#[cfg(not(target_family = "wasm"))]
+use core::sync::atomic::AtomicUsize;
 use core::task::{Context, Poll, Waker};
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Condvar;
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, TryLockError};
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
 
 use async_task::{Builder, Runnable};
 use concurrent_queue::ConcurrentQueue;
@@ -62,11 +68,376 @@ use slab::Slab;
 #[cfg(feature = "static")]
 mod static_executors;
 
+#[cfg(not(target_family = "wasm"))]
+mod worker_pool;
+
 #[doc(no_inline)]
 pub use async_task::{FallibleTask, Task};
 #[cfg(feature = "static")]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "static"))))]
 pub use static_executors::*;
+
+#[cfg(not(target_family = "wasm"))]
+pub use worker_pool::WorkerPool;
+
+/// A task whose single poll runs for longer than this is considered blocking.
+///
+/// Detection is based purely on observed behavior: callers do not have to opt in
+/// or mark blocking tasks in any way. Once a poll crosses the threshold the
+/// task is permanently classified as blocking and every later schedule goes to
+/// the blocking queue, so a single slow poll is enough to isolate a task.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const BLOCKING_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(10);
+
+/// Maximum number of dedicated threads used to run isolated blocking tasks.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const MAX_BLOCKING_THREADS: usize = 512;
+
+/// Per-task bookkeeping used to route blocking tasks away from async workers.
+///
+/// One allocation is shared between the task future and its schedule closure.
+/// The `blocking` flag is only ever flipped from `false` to `true`, so reads
+/// through a shared reference are sound with relaxed atomic ordering.
+pub(crate) struct TaskMeta {
+    /// Set to `true` once the task has been observed blocking a worker.
+    #[cfg(not(target_family = "wasm"))]
+    blocking: AtomicBool,
+
+    /// Whether this task is pinned to the thread that owns its executor.
+    ///
+    /// Tasks spawned on a `LocalExecutor` are not `Send` and therefore cannot
+    /// be moved onto a separate blocking thread.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    local: bool,
+}
+
+impl TaskMeta {
+    fn new(local: bool) -> Self {
+        Self {
+            #[cfg(not(target_family = "wasm"))]
+            blocking: AtomicBool::new(false),
+            local,
+        }
+    }
+
+    /// Marks the task as blocking. Returns `true` if this call performed the
+    /// transition.
+    #[cfg(not(target_family = "wasm"))]
+    fn mark_blocking(&self) -> bool {
+        self.blocking
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn is_blocking(&self) -> bool {
+        self.blocking.load(Ordering::Acquire)
+    }
+}
+
+pin_project! {
+    /// Wraps a spawned future so that its [`TaskMeta`] is reachable while it is
+    /// being polled. The wrapper adds no branches to the poll fast path beyond
+    /// publishing the metadata pointer for the currently running worker.
+    struct Tracked<Fut> {
+        #[pin]
+        future: Fut,
+        meta: Arc<TaskMeta>,
+    }
+}
+
+impl<Fut> Tracked<Fut> {
+    fn new(future: Fut, meta: Arc<TaskMeta>) -> Self {
+        Self { future, meta }
+    }
+}
+
+impl<Fut: Future> Future for Tracked<Fut> {
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        // Publish the metadata so the worker driving the poll can be linked to
+        // this task while it is on the stack.
+        CURRENT_META.with(|cell| cell.set(Some(this.meta.as_ref() as *const TaskMeta)));
+        #[cfg(not(target_family = "wasm"))]
+        let _guard = PollGuard::new(this.meta.as_ref());
+        let poll = this.future.poll(cx);
+        CURRENT_META.with(|cell| cell.set(None));
+        poll
+    }
+}
+
+/// On async worker threads, brackets a poll with the bookkeeping the watchdog
+/// needs. On threads without a registered worker slot (e.g. `try_tick`) it is
+/// a no-op, so ordinary in-thread execution pays no extra cost.
+#[cfg(not(target_family = "wasm"))]
+struct PollGuard;
+
+#[cfg(not(target_family = "wasm"))]
+impl PollGuard {
+    #[inline]
+    fn new(meta: &TaskMeta) -> Self {
+        CURRENT_SLOT.with(|cell| {
+            if let Some(ptr) = cell.get() {
+                // SAFETY: Worker slots are owned by the pool and outlive every
+                // poll performed by their worker thread.
+                let slot = unsafe { &*ptr };
+                slot.attach(meta);
+            }
+        });
+        Self
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Drop for PollGuard {
+    #[inline]
+    fn drop(&mut self) {
+        CURRENT_SLOT.with(|cell| {
+            if let Some(ptr) = cell.get() {
+                // SAFETY: See `new`.
+                let slot = unsafe { &*ptr };
+                slot.detach();
+            }
+        });
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+thread_local! {
+    /// Metadata of the task currently being polled on this thread, if any.
+    static CURRENT_META: core::cell::Cell<Option<*const TaskMeta>> =
+        const { core::cell::Cell::new(None) };
+
+    /// Slot of the worker currently running on this thread, if any.
+    static CURRENT_SLOT: core::cell::Cell<Option<*const WorkerSlot>> =
+        const { core::cell::Cell::new(None) };
+}
+
+#[cfg(target_family = "wasm")]
+thread_local! {
+    /// Metadata of the task currently being polled on this thread, if any.
+    static CURRENT_META: core::cell::Cell<Option<*const TaskMeta>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// State of a worker thread that is monitored for blocking polls.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct WorkerSlot {
+    /// Instant at which the current poll started, or `None` when idle.
+    ///
+    /// Only the worker thread mutates this; the watchdog only reads it.
+    poll_started: Mutex<Option<Instant>>,
+
+    /// Metadata of the task currently being polled.
+    ///
+    /// A raw pointer is safe here because the task future outlives its poll and
+    /// therefore outlives every access through this pointer.
+    current_meta: Mutex<Option<SendPtr<TaskMeta>>>,
+
+    /// Set by the watchdog when this worker has been observed blocking.
+    ///
+    /// The worker checks it after the offending poll finishes and exits so that
+    /// a replacement worker can keep the async concurrency at the configured
+    /// level.
+    evicted: AtomicBool,
+
+    /// Set by the worker itself once its run loop has fully exited.
+    finished: AtomicBool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WorkerSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            poll_started: Mutex::new(None),
+            current_meta: Mutex::new(None),
+            evicted: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    /// Links the worker to the task it is about to poll and starts the clock.
+    #[inline]
+    fn attach(&self, meta: &TaskMeta) {
+        *self.poll_started.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+        *self.current_meta.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(SendPtr(meta as *const TaskMeta));
+    }
+
+    /// Clears the poll bookkeeping after the poll returns.
+    #[inline]
+    fn detach(&self) {
+        *self.poll_started.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.current_meta.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Marks the worker run loop as fully exited.
+    fn mark_finished(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    /// Whether the worker thread has finished its run loop.
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` while the worker has spent longer than the blocking
+    /// threshold inside the current poll.
+    fn is_stuck(&self, now: Instant) -> bool {
+        match *self.poll_started.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(started) => now.duration_since(started) >= BLOCKING_THRESHOLD,
+            None => false,
+        }
+    }
+
+    /// Marks both the worker and the task it is currently polling as blocking.
+    fn evict(&self) {
+        self.evicted.store(true, Ordering::Release);
+        if let Some(SendPtr(ptr)) = *self
+            .current_meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            // SAFETY: The task is currently being polled, so its `TaskMeta` is
+            // alive for at least as long as this call.
+            let meta = unsafe { &*ptr };
+            meta.mark_blocking();
+        }
+    }
+
+    fn is_evicted(&self) -> bool {
+        self.evicted.load(Ordering::Acquire)
+    }
+}
+
+/// A raw pointer wrapper that opts into `Send`/`Sync`.
+///
+/// The pointee is only ever dereferenced while its owning task is mid-poll,
+/// which guarantees the [`TaskMeta`] remains alive and its atomic flag
+/// provides the actual synchronization.
+#[cfg(not(target_family = "wasm"))]
+struct SendPtr<T>(*const T);
+
+// SAFETY: The pointer is only dereferenced while its owning task is mid-poll,
+// which guarantees the pointee is alive; the `TaskMeta` atomic flag provides
+// all actual cross-thread synchronization.
+#[cfg(not(target_family = "wasm"))]
+unsafe impl<T> Send for SendPtr<T> {}
+// SAFETY: See the `Send` implementation above.
+#[cfg(not(target_family = "wasm"))]
+unsafe impl<T> Sync for SendPtr<T> {}
+
+#[cfg(not(target_family = "wasm"))]
+/// A dedicated queue for tasks that have been observed blocking an async worker.
+///
+/// Runnables land here through the same schedule callback as ordinary tasks;
+/// the global async queue is never touched by a classified blocking task.
+pub(crate) struct BlockingQueue {
+    /// Pending blocking runnables.
+    queue: ConcurrentQueue<Runnable>,
+
+    /// Number of blocking worker threads currently alive.
+    threads: Mutex<usize>,
+
+    /// Signaled whenever work is enqueued or the executor shuts down.
+    wakeup: Condvar,
+
+    /// Incremented every time a runnable is enqueued so a pool can grow the
+    /// number of blocking threads to match demand.
+    enqueued: AtomicUsize,
+
+    /// Incremented every time a blocking thread starts running a runnable.
+    processed: AtomicUsize,
+
+    /// Set when the owning executor is being dropped.
+    shutdown: AtomicBool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl BlockingQueue {
+    const fn new() -> Self {
+        Self {
+            queue: ConcurrentQueue::unbounded(),
+            threads: Mutex::new(0),
+            wakeup: Condvar::new(),
+            enqueued: AtomicUsize::new(0),
+            processed: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    /// Waits for work with a timeout so idle blocking threads can exit.
+    fn pop_timeout(&self, timeout: std::time::Duration) -> Option<Runnable> {
+        if let Ok(runnable) = self.queue.pop() {
+            return Some(runnable);
+        }
+        let guard = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        let (guard, _) = self
+            .wakeup
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|err| err.into_inner());
+        drop(guard);
+        self.queue.pop().ok()
+    }
+
+    /// Stops blocking threads once their current work is done.
+    fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.wakeup.notify_all();
+    }
+
+    /// Whether the queue has been shut down.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Number of blocking threads currently alive.
+    fn thread_count(&self) -> usize {
+        *self.threads.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers a newly spawned blocking thread.
+    fn add_thread(&self) {
+        *self.threads.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    }
+
+    /// Unregisters a blocking thread that is about to exit.
+    fn remove_thread(&self) {
+        let mut guard = self.threads.lock().unwrap_or_else(PoisonError::into_inner);
+        *guard = guard.saturating_sub(1);
+    }
+
+    /// Pending blocking runnables.
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Enqueues a blocking runnable, wakes a thread and bumps the demand counter.
+    fn push(&self, runnable: Runnable) {
+        let result = self.queue.push(runnable);
+        debug_assert!(result.is_ok());
+        self.enqueued.fetch_add(1, Ordering::AcqRel);
+        self.wakeup.notify_one();
+    }
+
+    /// Monotonic counter of enqueued blocking runnables.
+    fn enqueued_count(&self) -> usize {
+        self.enqueued.load(Ordering::Acquire)
+    }
+
+    /// Records that a blocking thread started running a runnable.
+    fn record_processed(&self) {
+        self.processed.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Number of runnables executed by blocking threads so far.
+    fn processed_count(&self) -> usize {
+        self.processed.load(Ordering::Acquire)
+    }
+}
 
 /// An async executor.
 ///
@@ -170,7 +541,7 @@ impl<'a> Executor<'a> {
         let mut active = self.state().active();
 
         // SAFETY: `T` and the future are `Send`.
-        unsafe { self.spawn_inner(future, &mut active) }
+        unsafe { self.spawn_inner(future, &mut active, false) }
     }
 
     /// Spawns many tasks onto the executor.
@@ -223,7 +594,7 @@ impl<'a> Executor<'a> {
         // Convert the futures into tasks.
         let tasks = futures.into_iter().enumerate().map(move |(i, future)| {
             // SAFETY: `T` and the future are `Send`.
-            let task = unsafe { self.spawn_inner(future, active.as_mut().unwrap()) };
+            let task = unsafe { self.spawn_inner(future, active.as_mut().unwrap(), false) };
 
             // Yield the lock every once in a while to ease contention.
             if i.wrapping_sub(1) % 500 == 0 {
@@ -247,12 +618,15 @@ impl<'a> Executor<'a> {
         &self,
         future: impl Future<Output = T> + 'a,
         active: &mut Slab<Waker>,
+        local: bool,
     ) -> Task<T> {
         // Remove the task from the set of active tasks when the future finishes.
         let entry = active.vacant_entry();
         let index = entry.key();
         let state = self.state_as_arc();
-        let future = AsyncCallOnDrop::new(future, move || drop(state.active().try_remove(index)));
+        let meta = Arc::new(TaskMeta::new(local));
+        let tracked = Tracked::new(future, meta.clone());
+        let future = AsyncCallOnDrop::new(tracked, move || drop(state.active().try_remove(index)));
 
         // Create the task and register it in the set of active tasks.
         //
@@ -273,12 +647,12 @@ impl<'a> Executor<'a> {
         // the `Executor` is drained of all of its runnables. This ensures that
         // runnables are dropped and this precondition is satisfied.
         //
-        // `self.schedule()` is `Send`, `Sync` and `'static`, as checked below.
-        // Therefore we do not need to worry about what is done with the
-        // `Waker`.
+        // `self.schedule_with_meta(..)` is `Send`, `Sync` and `'static`, as
+        // checked below. Therefore we do not need to worry about what is done
+        // with the `Waker`.
         let (runnable, task) = Builder::new()
             .propagate_panic(true)
-            .spawn_unchecked(|()| future, self.schedule());
+            .spawn_unchecked(|()| future, self.schedule_with_meta(meta));
         entry.insert(runnable.waker());
 
         runnable.schedule();
@@ -348,16 +722,16 @@ impl<'a> Executor<'a> {
         self.state().run(future).await
     }
 
-    /// Returns a function that schedules a runnable task when it gets woken up.
-    fn schedule(&self) -> impl Fn(Runnable) + Send + Sync + 'static {
+    /// Returns a schedule closure that routes blocked tasks to the blocking queue.
+    ///
+    /// Each task owns its [`TaskMeta`]; the closure keeps the other half alive
+    /// for as long as the task can be rescheduled.
+    fn schedule_with_meta(
+        &self,
+        meta: Arc<TaskMeta>,
+    ) -> impl Fn(Runnable) + Send + Sync + 'static {
         let state = self.state_as_arc();
-
-        // TODO: If possible, push into the current local queue and notify the ticker.
-        move |runnable| {
-            let result = state.queue.push(runnable);
-            debug_assert!(result.is_ok()); // Since we use unbounded queue, push will never fail.
-            state.notify();
-        }
+        move |runnable| state.schedule_runnable(runnable, &meta)
     }
 
     /// Returns a pointer to the inner state.
@@ -407,6 +781,12 @@ impl<'a> Executor<'a> {
         std::mem::forget(arc);
         clone
     }
+
+    /// Returns a reference to the blocking queue backing this executor.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn state_blocking(&self) -> &BlockingQueue {
+        &self.state().blocking_queue
+    }
 }
 
 impl Drop for Executor<'_> {
@@ -427,6 +807,13 @@ impl Drop for Executor<'_> {
         drop(active);
 
         while state.queue.pop().is_ok() {}
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+        // Stop blocking threads and drop any runnables that never got to run.
+        state.blocking_queue.shutdown();
+        while state.blocking_queue.queue.pop().is_ok() {}
+        }
     }
 }
 
@@ -526,7 +913,7 @@ impl<'a> LocalExecutor<'a> {
 
         // SAFETY: This executor is not thread safe, so the future and its result
         //         cannot be sent to another thread.
-        unsafe { self.inner().spawn_inner(future, &mut active) }
+        unsafe { self.inner().spawn_inner(future, &mut active, true) }
     }
 
     /// Spawns many tasks onto the executor.
@@ -579,7 +966,7 @@ impl<'a> LocalExecutor<'a> {
         let tasks = futures.into_iter().map(|future| {
             // SAFETY: This executor is not thread safe, so the future and its result
             //         cannot be sent to another thread.
-            unsafe { self.inner().spawn_inner(future, &mut active) }
+            unsafe { self.inner().spawn_inner(future, &mut active, true) }
 
             // As only one thread can spawn or poll tasks at a time, there is no need
             // to release lock contention here.
@@ -669,6 +1056,10 @@ struct State {
     /// The global queue.
     queue: ConcurrentQueue<Runnable>,
 
+    /// Tasks that were observed blocking and must not run on async workers.
+    #[cfg(not(target_family = "wasm"))]
+    blocking_queue: BlockingQueue,
+
     /// Local queues created by runners.
     local_queues: RwLock<Vec<Arc<ConcurrentQueue<Runnable>>>>,
 
@@ -687,6 +1078,8 @@ impl State {
     const fn new() -> Self {
         Self {
             queue: ConcurrentQueue::unbounded(),
+            #[cfg(not(target_family = "wasm"))]
+            blocking_queue: BlockingQueue::new(),
             local_queues: RwLock::new(Vec::new()),
             notified: AtomicBool::new(true),
             sleepers: Mutex::new(Sleepers {
@@ -695,6 +1088,28 @@ impl State {
                 free_ids: Vec::new(),
             }),
             active: Mutex::new(Slab::new()),
+        }
+    }
+
+    /// Schedules a runnable, routing tasks previously observed blocking to the
+    /// dedicated blocking queue.
+    ///
+    /// The fast path for ordinary tasks is a single relaxed atomic load and a
+    /// push onto the same global queue as before.
+    #[inline]
+    fn schedule_runnable(&self, runnable: Runnable, meta: &TaskMeta) {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if !meta.local && meta.is_blocking() {
+                self.blocking_queue.push(runnable);
+                return;
+            }
+        }
+        let _ = meta;
+        {
+            let result = self.queue.push(runnable);
+            debug_assert!(result.is_ok()); // Since we use unbounded queue, push will never fail.
+            self.notify();
         }
     }
 
@@ -1216,9 +1631,9 @@ fn _ensure_send_and_sync() {
     is_sync(ex.run(pending::<()>()));
     is_send(ex.tick());
     is_sync(ex.tick());
-    is_send(ex.schedule());
-    is_sync(ex.schedule());
-    is_static(ex.schedule());
+    is_send(ex.schedule_with_meta(Arc::new(TaskMeta::new(false))));
+    is_sync(ex.schedule_with_meta(Arc::new(TaskMeta::new(false))));
+    is_static(ex.schedule_with_meta(Arc::new(TaskMeta::new(false))));
 
     /// ```compile_fail
     /// use async_executor::LocalExecutor;
